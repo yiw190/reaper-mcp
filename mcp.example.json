@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "reaper": {
+      "command": "python3",
+      "args": ["/absolute/path/to/reaper-mcp/python/server.py"]
+    }
+  }
+}
