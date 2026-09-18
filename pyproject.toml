@@ -1,7 +1,7 @@
 [project]
 name = "reaper-mcp"
 version = "0.1.0"
-description = "Small MCP server for Cockos REAPER: 11 grouped tools, file IPC, no 180-tool dump."
+description = "MCP server for controlling Cockos REAPER."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
