@@ -7,8 +7,10 @@ tools plus batch / run_lua instead of dumping the whole ReaScript API.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import struct
 import sys
 import time
 import uuid
@@ -21,13 +23,14 @@ else:
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "reaper-mcp"
 SERVER_VERSION = "0.1.0"
-HEARTBEAT_STALE = 5.0
+HEARTBEAT_STALE = float(os.environ.get("REAPER_MCP_HEARTBEAT_STALE", "5"))
 POLL = 0.015
 RENDER_TIMEOUT = float(os.environ.get("REAPER_MCP_RENDER_TIMEOUT", "300"))
 
 INSTRUCTIONS = (
     "Drive REAPER. Time is beats (quarter notes), track/item indices are 0-based. "
     "Call status first. Prefer batch for multi-step edits. "
+    "Do not ExecProcess long commands in run_lua; it blocks the bridge. "
     "Use run_lua or reaper_call only for APIs not covered by the grouped tools."
 )
 
@@ -66,6 +69,7 @@ class Bridge:
         self.req = os.path.join(self.dir, "request.json")
         self.resp = os.path.join(self.dir, "response.json")
         self.heart = os.path.join(self.dir, "heartbeat")
+        self.busy = os.path.join(self.dir, "busy")
         self.mutex = os.path.join(self.dir, "ipc.mutex")
         self.timeout = float(os.environ.get("REAPER_MCP_TIMEOUT", "10"))
         os.makedirs(self.dir, exist_ok=True)
@@ -75,6 +79,9 @@ class Bridge:
             return (time.time() - os.path.getmtime(self.heart)) < HEARTBEAT_STALE
         except OSError:
             return False
+
+    def _busy(self) -> bool:
+        return os.path.exists(self.busy)
 
     def _refuse(self) -> None:
         if _is_wsl():
@@ -133,8 +140,17 @@ class Bridge:
         wait = timeout if timeout is not None else self.timeout
         fd = self._lock(wait)
         try:
-            if not self._heartbeat_ok():
-                self._refuse()
+            deadline = time.time() + wait
+            while True:
+                if self._heartbeat_ok() and not self._busy():
+                    break
+                if time.time() >= deadline:
+                    if self._busy():
+                        raise BridgeError(
+                            "Timed out waiting for REAPER to finish the previous request."
+                        )
+                    self._refuse()
+                time.sleep(POLL)
             rid = uuid.uuid4().hex[:12]
             payload = {"id": rid, "func": func}
             if code is not None:
@@ -150,10 +166,7 @@ class Bridge:
                 json.dump(payload, f)
             os.replace(tmp, self.req)
 
-            deadline = time.time() + wait
             while time.time() < deadline:
-                if not self._heartbeat_ok():
-                    self._refuse()
                 if os.path.exists(self.resp):
                     try:
                         with open(self.resp, encoding="utf-8") as f:
@@ -242,7 +255,7 @@ tool(
     "bus creates a submix named `name` and routes source_indices to it.",
     obj({
         "action": {"type": "string", "enum": ["list", "add", "delete", "update", "bus"]},
-        "index": {"type": "integer", "minimum": 0},
+        "index": {"type": "integer", "minimum": -1},
         "name": {"type": "string"},
         "volume_db": {"type": "number"},
         "pan": {"type": "number", "minimum": -1, "maximum": 1},
@@ -299,15 +312,19 @@ tool(
 
 tool(
     "fx",
-    "Track FX. action: list | add | params | set. "
-    "set accepts param as index or name, value 0..1 (REAPER normalized).",
+    "Track FX. action: list | add | params | set | delete | bypass | move | preset. "
+    "track_index -1 is the master. set value is 0..1 (REAPER normalized).",
     obj({
-        "action": {"type": "string", "enum": ["list", "add", "params", "set"]},
-        "track_index": {"type": "integer", "minimum": 0},
+        "action": {"type": "string",
+                   "enum": ["list", "add", "params", "set", "delete", "bypass", "move", "preset"]},
+        "track_index": {"type": "integer", "minimum": -1},
         "fx_index": {"type": "integer", "minimum": 0},
         "fx_name": {"type": "string"},
         "param": {"type": ["string", "integer"]},
         "value": {"type": "number"},
+        "enabled": {"type": "boolean"},
+        "dest_index": {"type": "integer", "minimum": 0},
+        "preset": {"type": "string"},
     }, ["action", "track_index"]),
     lambda b, a: {
         "list": lambda: b.call("list_track_fx", [a["track_index"]]),
@@ -315,6 +332,92 @@ tool(
         "params": lambda: b.call("get_fx_params", [a["track_index"], a["fx_index"]]),
         "set": lambda: b.call("set_fx_param",
                               [a["track_index"], a["fx_index"], a["param"], a["value"]]),
+        "delete": lambda: b.call("delete_track_fx", [a["track_index"], a["fx_index"]]),
+        "bypass": lambda: b.call("set_fx_enabled",
+                                 [a["track_index"], a["fx_index"], a.get("enabled", False)]),
+        "move": lambda: b.call("move_track_fx",
+                               [a["track_index"], a["fx_index"], a["dest_index"]]),
+        "preset": lambda: b.call("set_fx_preset",
+                                 [a["track_index"], a["fx_index"], a.get("preset", "")]),
+    }[a["action"]](),
+)
+
+tool(
+    "send",
+    "Track sends. action: list | add | delete | update. "
+    "track_index is the source (-1 master). dest_index is the destination track.",
+    obj({
+        "action": {"type": "string", "enum": ["list", "add", "delete", "update"]},
+        "track_index": {"type": "integer", "minimum": -1},
+        "send_index": {"type": "integer", "minimum": 0},
+        "dest_index": {"type": "integer", "minimum": -1},
+        "volume_db": {"type": "number"},
+        "pan": {"type": "number", "minimum": -1, "maximum": 1},
+        "mute": {"type": "boolean"},
+    }, ["action", "track_index"]),
+    lambda b, a: {
+        "list": lambda: b.call("list_sends", [a["track_index"]]),
+        "add": lambda: b.call("add_send", [a["track_index"], a["dest_index"]]),
+        "delete": lambda: b.call("delete_send", [a["track_index"], a["send_index"]]),
+        "update": lambda: b.call("update_send", [a["track_index"], a["send_index"],
+                                                 _props(a, ("volume_db", "pan", "mute"))]),
+    }[a["action"]](),
+)
+
+tool(
+    "item",
+    "Media items on a track. action: list | update. "
+    "fade_in / fade_out are seconds (REAPER native). position/length are beats.",
+    obj({
+        "action": {"type": "string", "enum": ["list", "update"]},
+        "track_index": {"type": "integer", "minimum": 0},
+        "item_index": {"type": "integer", "minimum": 0},
+        "gain_db": {"type": "number"},
+        "fade_in": {"type": "number", "minimum": 0},
+        "fade_out": {"type": "number", "minimum": 0},
+        "loop": {"type": "boolean"},
+        "mute": {"type": "boolean"},
+        "position_beats": {"type": "number", "minimum": 0},
+        "length_beats": {"type": "number", "minimum": 0},
+    }, ["action", "track_index"]),
+    lambda b, a: {
+        "list": lambda: b.call("list_items", [a["track_index"]]),
+        "update": lambda: b.call("update_item", [a["track_index"], a["item_index"],
+                                                 _props(a, ("gain_db", "fade_in", "fade_out",
+                                                            "loop", "mute", "position_beats",
+                                                            "length_beats"))]),
+    }[a["action"]](),
+)
+
+tool(
+    "envelope",
+    "Track envelopes. action: list | get | set. "
+    "name is REAPER envelope name (Volume, Pan, Mute, ...). "
+    "set replaces all points. value is native envelope value (Volume 1.0 = 0 dB).",
+    obj({
+        "action": {"type": "string", "enum": ["list", "get", "set"]},
+        "track_index": {"type": "integer", "minimum": -1},
+        "name": {"type": "string"},
+        "envelope_index": {"type": "integer", "minimum": 0},
+        "points": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "beats": {"type": "number"},
+                "value": {"type": "number"},
+                "shape": {"type": "integer"},
+                "tension": {"type": "number"},
+                "selected": {"type": "boolean"},
+            },
+            "required": ["beats", "value"],
+        }},
+    }, ["action", "track_index"]),
+    lambda b, a: {
+        "list": lambda: b.call("list_envelopes", [a["track_index"]]),
+        "get": lambda: b.call("get_envelope",
+                              [a["track_index"], a.get("name", a.get("envelope_index", 0))]),
+        "set": lambda: b.call("set_envelope",
+                              [a["track_index"], a.get("name", a.get("envelope_index", 0)),
+                               a.get("points") or []]),
     }[a["action"]](),
 )
 
@@ -348,10 +451,31 @@ tool(
 
 tool(
     "render",
-    "Render with the project's last render settings. Optional path overwrite. "
-    "No undo. Long timeout.",
-    obj({"path": {"type": "string"}}),
-    lambda b, a: b.call("render_project", [a.get("path")], timeout=RENDER_TIMEOUT),
+    "Render. No undo. Long timeout. "
+    "bounds: project | time_selection | custom | items. "
+    "stems=true renders selected tracks (pass track_indices to select).",
+    obj({
+        "path": {"type": "string"},
+        "bounds": {"type": "string",
+                   "enum": ["project", "time_selection", "custom", "items"]},
+        "start_beats": {"type": "number", "minimum": 0},
+        "end_beats": {"type": "number", "minimum": 0},
+        "stems": {"type": "boolean"},
+        "track_indices": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+        "sample_rate": {"type": "integer", "minimum": 1},
+        "channels": {"type": "integer", "minimum": 1},
+        "pattern": {"type": "string"},
+    }),
+    lambda b, a: b.call("render_project", [a.get("path"), {
+        "bounds": a.get("bounds") or "project",
+        "start_beats": a.get("start_beats"),
+        "end_beats": a.get("end_beats"),
+        "stems": a.get("stems"),
+        "track_indices": a.get("track_indices"),
+        "sample_rate": a.get("sample_rate"),
+        "channels": a.get("channels"),
+        "pattern": a.get("pattern"),
+    }], timeout=RENDER_TIMEOUT),
 )
 
 tool(
