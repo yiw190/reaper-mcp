@@ -8,7 +8,7 @@ MCP server for [REAPER](https://reaper.fm).
 MCP client  --stdio JSON-RPC-->  python/server.py  --JSON mailbox-->  lua/bridge.lua (inside REAPER)
 ```
 
-Eleven grouped tools. Multi-step edits go through `batch`; anything else through `reaper_call` / `run_lua`.
+Fourteen grouped tools. Multi-step edits go through `batch`; anything else through `reaper_call` / `run_lua`. Track index `-1` is the master. Time is project quarter notes.
 
 ## Setup
 
@@ -45,7 +45,7 @@ Mailbox is `%APPDATA%/reaper-mcp/ipc` (ASCII path both sides derive). Time is **
 
 ## Tools
 
-`status` `transport` `track` `midi` `fx` `project` `render` `action` `reaper_call` `run_lua` `batch`
+`status` `transport` `track` `midi` `fx` `send` `item` `envelope` `project` `render` `action` `reaper_call` `run_lua` `batch`
 
 ## Tests
 
