@@ -21,6 +21,7 @@ def fake_bridge(bridge_dir, stop):
     req = os.path.join(bridge_dir, "request.json")
     resp = os.path.join(bridge_dir, "response.json")
     heart = os.path.join(bridge_dir, "heartbeat")
+    busy = os.path.join(bridge_dir, "busy")
     while not stop.is_set():
         with open(heart, "w", encoding="utf-8") as f:
             f.write(str(time.time()))
@@ -33,6 +34,14 @@ def fake_bridge(bridge_dir, stop):
                 time.sleep(0.005)
                 continue
             func = payload.get("func")
+            if func == "run_lua" and (payload.get("code") or "") == "slow":
+                with open(busy, "w", encoding="utf-8") as f:
+                    f.write("1")
+                time.sleep(0.6)
+                try:
+                    os.remove(busy)
+                except OSError:
+                    pass
             if func == "get_project_summary":
                 ret = {"project": "(unsaved)", "tempo_bpm": 120.0,
                        "track_count": 1,
@@ -71,7 +80,12 @@ def main():
     stop = threading.Event()
     threading.Thread(target=fake_bridge, args=(bridge_dir, stop), daemon=True).start()
 
-    env = dict(os.environ, REAPER_MCP_IPC_DIR=bridge_dir, REAPER_MCP_TIMEOUT="5")
+    env = dict(
+        os.environ,
+        REAPER_MCP_IPC_DIR=bridge_dir,
+        REAPER_MCP_TIMEOUT="5",
+        REAPER_MCP_HEARTBEAT_STALE="0.2",
+    )
     proc = subprocess.Popen(
         [sys.executable, SERVER],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
@@ -86,10 +100,11 @@ def main():
 
     try:
         src = open(BRIDGE, encoding="utf-8").read()
-        check("beats anchored at measure 0",
-              "TimeMap2_beatsToTime(0, b, 0)" in src
-              and "TimeMap2_beatsToTime(0, b, -1)" not in src)
+        check("beats are project QN",
+              "TimeMap2_QNToTime(0, b" in src
+              and "TimeMap2_beatsToTime(0, b, 0)" not in src)
         check("heartbeat file", "heartbeat" in src)
+        check("busy file while dispatch blocked", "busy" in src)
         check("MIDI undo uses OnStateChange_Item",
               "Undo_OnStateChange_Item" in src)
         check("APPDATA mailbox", "reaper-mcp" in src and "APPDATA" in src)
@@ -101,9 +116,10 @@ def main():
 
         r = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = {t["name"] for t in r["result"]["tools"]}
-        check("small tool surface", 8 <= len(names) <= 14)
+        check("small tool surface", 8 <= len(names) <= 16)
         check("core tools", {"status", "track", "midi", "fx", "batch", "run_lua",
                              "reaper_call"} <= names)
+        check("mix primitives", {"send", "item", "envelope"} <= names)
         check("no 100-tool dump", "setup_sidechain_compression" not in names)
         print("       tools:", sorted(names), "count=", len(names))
 
@@ -135,6 +151,14 @@ def main():
         check("batch keeps run_lua", body[1]["ret"]["echo"] == "run_lua")
 
         r = rpc(proc, {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                       "params": {"name": "run_lua", "arguments": {"code": "slow"}}})
+        check("busy bridge is not stale", r["result"]["isError"] is False)
+
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                       "params": {"name": "status", "arguments": {}}})
+        check("status after slow request", "Drums" in r["result"]["content"][0]["text"])
+
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
                        "params": {"name": "nope", "arguments": {}}})
         check("unknown tool errors", "error" in r)
     finally:
