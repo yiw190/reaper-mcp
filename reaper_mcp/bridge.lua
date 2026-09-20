@@ -4,6 +4,7 @@
   Python writes  <ipc>/request.json   {id, func, args|code}
   Lua writes     <ipc>/response.json  {id, ok, ret|error}
   Lua touches    <ipc>/heartbeat      every defer tick
+  Lua writes     <ipc>/busy           while dispatch is running (defer cannot tick)
 
   Load via Actions > Load ReaScript and keep it running.
 ]]
@@ -43,6 +44,7 @@ local REQ = DIR .. "request.json"
 local RESP = DIR .. "response.json"
 local TMP = DIR .. "response.tmp"
 local HEART = DIR .. "heartbeat"
+local BUSY = DIR .. "busy"
 
 ----------------------------------------------------------------------
 -- JSON
@@ -259,13 +261,15 @@ end
 -- DSL
 ----------------------------------------------------------------------
 local function track_at(i)
+  if i == -1 then return reaper.GetMasterTrack(0) end
   local t = reaper.GetTrack(0, i)
   if not t then error("no track at index " .. tostring(i)) end
   return t
 end
 
--- Absolute project quarter notes. Anchor at measure 0 (not -1).
-local function beats_to_time(b) return reaper.TimeMap2_beatsToTime(0, b, 0) end
+-- Absolute project quarter notes.
+local function beats_to_time(b) return reaper.TimeMap2_QNToTime(0, b or 0) end
+local function time_to_beats(t) return reaper.TimeMap2_timeToQN(0, t or 0) end
 
 local dispatch
 local DSL = {}
@@ -327,6 +331,7 @@ function DSL.add_track(name, index)
 end
 
 function DSL.delete_track(index)
+  if index == -1 then error("cannot delete the master track") end
   reaper.DeleteTrack(track_at(index))
   reaper.UpdateArrange()
   return { ret = true }
@@ -387,6 +392,7 @@ function DSL.create_midi_item(ti, start_beats, length_beats)
   local s = beats_to_time(start_beats or 0)
   local e = beats_to_time((start_beats or 0) + (length_beats or 4))
   local item = reaper.CreateNewMIDIItemInProj(t, s, e, false)
+  reaper.SetMediaItemInfo_Value(item, "B_LOOPSRC", 0)
   local idx = -1
   for i = 0, reaper.CountTrackMediaItems(t) - 1 do
     if reaper.GetTrackMediaItem(t, i) == item then idx = i break end
@@ -528,7 +534,8 @@ function DSL.add_track_fx(ti, fx_name)
   local t = track_at(ti)
   local fx = reaper.TrackFX_AddByName(t, fx_name, false, -1)
   if fx < 0 then error("could not add FX: " .. tostring(fx_name)) end
-  return { ret = { fx_index = fx, name = fx_name } }
+  local _, got = reaper.TrackFX_GetFXName(t, fx, "")
+  return { ret = { fx_index = fx, name = got } }
 end
 
 function DSL.list_track_fx(ti)
@@ -572,6 +579,203 @@ function DSL.set_fx_param(ti, fxi, param, value)
   return { ret = { param_index = pidx, value = v } }
 end
 
+function DSL.delete_track_fx(ti, fxi)
+  local t = track_at(ti)
+  if not reaper.TrackFX_Delete(t, fxi) then error("could not delete FX " .. tostring(fxi)) end
+  return { ret = true }
+end
+
+function DSL.set_fx_enabled(ti, fxi, enabled)
+  reaper.TrackFX_SetEnabled(track_at(ti), fxi, enabled and true or false)
+  return { ret = { enabled = reaper.TrackFX_GetEnabled(track_at(ti), fxi) } }
+end
+
+function DSL.move_track_fx(ti, fxi, dest_index)
+  local t = track_at(ti)
+  if not reaper.TrackFX_CopyToTrack(t, fxi, t, dest_index, true) then
+    error("could not move FX")
+  end
+  return { ret = { fx_index = dest_index } }
+end
+
+function DSL.set_fx_preset(ti, fxi, preset)
+  local t = track_at(ti)
+  if preset and preset ~= "" then
+    if not reaper.TrackFX_SetPreset(t, fxi, preset) then
+      error("could not set preset: " .. tostring(preset))
+    end
+  end
+  local _, name = reaper.TrackFX_GetPreset(t, fxi, "")
+  return { ret = { preset = name } }
+end
+
+function DSL.list_sends(ti)
+  local t = track_at(ti)
+  local out = {}
+  local n = reaper.GetTrackNumSends(t, 0)
+  for i = 0, n - 1 do
+    local dest = reaper.GetTrackSendInfo_Value(t, 0, i, "P_DESTTRACK")
+    local dest_index = -1
+    if dest then
+      if dest == reaper.GetMasterTrack(0) then
+        dest_index = -1
+      else
+        dest_index = math.floor(reaper.GetMediaTrackInfo_Value(dest, "IP_TRACKNUMBER") - 1)
+      end
+    end
+    local vol = reaper.GetTrackSendInfo_Value(t, 0, i, "D_VOL")
+    local db = (vol <= 0) and -150 or (20 * math.log(vol) / math.log(10))
+    out[#out + 1] = {
+      send_index = i,
+      dest_index = dest_index,
+      volume_db = db,
+      pan = reaper.GetTrackSendInfo_Value(t, 0, i, "D_PAN"),
+      mute = reaper.GetTrackSendInfo_Value(t, 0, i, "B_MUTE") == 1,
+    }
+  end
+  return { ret = out }
+end
+
+function DSL.add_send(ti, dest_index)
+  local src = track_at(ti)
+  local dest = track_at(dest_index)
+  local idx = reaper.CreateTrackSend(src, dest)
+  if idx < 0 then error("could not create send") end
+  return { ret = { send_index = idx, dest_index = dest_index } }
+end
+
+function DSL.delete_send(ti, send_index)
+  if not reaper.RemoveTrackSend(track_at(ti), 0, send_index) then
+    error("could not delete send")
+  end
+  return { ret = true }
+end
+
+function DSL.update_send(ti, send_index, props)
+  local t = track_at(ti)
+  props = props or {}
+  if props.volume_db ~= nil then
+    reaper.SetTrackSendInfo_Value(t, 0, send_index, "D_VOL", 10 ^ (props.volume_db / 20))
+  end
+  if props.pan ~= nil then
+    reaper.SetTrackSendInfo_Value(t, 0, send_index, "D_PAN", props.pan)
+  end
+  if props.mute ~= nil then
+    reaper.SetTrackSendInfo_Value(t, 0, send_index, "B_MUTE", props.mute and 1 or 0)
+  end
+  return { ret = true }
+end
+
+function DSL.list_items(ti)
+  local t = track_at(ti)
+  local out = {}
+  for i = 0, reaper.CountTrackMediaItems(t) - 1 do
+    local item = reaper.GetTrackMediaItem(t, i)
+    local vol = reaper.GetMediaItemInfo_Value(item, "D_VOL")
+    local db = (vol <= 0) and -150 or (20 * math.log(vol) / math.log(10))
+    out[#out + 1] = {
+      item_index = i,
+      position_beats = time_to_beats(reaper.GetMediaItemInfo_Value(item, "D_POSITION")),
+      length_beats = time_to_beats(reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+        + reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
+        - time_to_beats(reaper.GetMediaItemInfo_Value(item, "D_POSITION")),
+      gain_db = db,
+      fade_in = reaper.GetMediaItemInfo_Value(item, "D_FADEINLEN"),
+      fade_out = reaper.GetMediaItemInfo_Value(item, "D_FADEOUTLEN"),
+      loop = reaper.GetMediaItemInfo_Value(item, "B_LOOPSRC") == 1,
+      mute = reaper.GetMediaItemInfo_Value(item, "B_MUTE") == 1,
+    }
+  end
+  return { ret = out }
+end
+
+function DSL.update_item(ti, ii, props)
+  local item = reaper.GetTrackMediaItem(track_at(ti), ii)
+  if not item then error("no item at index " .. tostring(ii)) end
+  props = props or {}
+  if props.gain_db ~= nil then
+    reaper.SetMediaItemInfo_Value(item, "D_VOL", 10 ^ (props.gain_db / 20))
+  end
+  if props.fade_in ~= nil then
+    reaper.SetMediaItemInfo_Value(item, "D_FADEINLEN", props.fade_in)
+  end
+  if props.fade_out ~= nil then
+    reaper.SetMediaItemInfo_Value(item, "D_FADEOUTLEN", props.fade_out)
+  end
+  if props.loop ~= nil then
+    reaper.SetMediaItemInfo_Value(item, "B_LOOPSRC", props.loop and 1 or 0)
+  end
+  if props.mute ~= nil then
+    reaper.SetMediaItemInfo_Value(item, "B_MUTE", props.mute and 1 or 0)
+  end
+  if props.position_beats ~= nil then
+    reaper.SetMediaItemPosition(item, beats_to_time(props.position_beats), false)
+  end
+  if props.length_beats ~= nil then
+    local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local pos_b = time_to_beats(pos)
+    reaper.SetMediaItemLength(item, beats_to_time(pos_b + props.length_beats) - pos, false)
+  end
+  reaper.UpdateArrange()
+  return { ret = true }
+end
+
+function DSL.list_envelopes(ti)
+  local t = track_at(ti)
+  local out = {}
+  for i = 0, reaper.CountTrackEnvelopes(t) - 1 do
+    local env = reaper.GetTrackEnvelope(t, i)
+    local _, name = reaper.GetEnvelopeName(env, "")
+    local vis = reaper.GetEnvelopeInfo_Value and reaper.GetEnvelopeInfo_Value(env, "VISIBLE") or 1
+    out[#out + 1] = { index = i, name = name, n_points = reaper.CountEnvelopePoints(env) }
+  end
+  return { ret = out }
+end
+
+local function envelope_at(ti, name_or_index)
+  local t = track_at(ti)
+  if type(name_or_index) == "number" then
+    local env = reaper.GetTrackEnvelope(t, name_or_index)
+    if not env then error("no envelope at index " .. tostring(name_or_index)) end
+    return env
+  end
+  local env = reaper.GetTrackEnvelopeByName(t, tostring(name_or_index))
+  if not env then error("no envelope named " .. tostring(name_or_index)) end
+  return env
+end
+
+function DSL.get_envelope(ti, name_or_index)
+  local env = envelope_at(ti, name_or_index)
+  local _, name = reaper.GetEnvelopeName(env, "")
+  local pts = {}
+  for i = 0, reaper.CountEnvelopePoints(env) - 1 do
+    local ok, time, value, shape, tension, selected = reaper.GetEnvelopePoint(env, i)
+    if ok then
+      pts[#pts + 1] = {
+        beats = time_to_beats(time),
+        value = value,
+        shape = shape,
+        tension = tension,
+        selected = selected,
+      }
+    end
+  end
+  return { ret = { name = name, points = pts } }
+end
+
+function DSL.set_envelope(ti, name_or_index, points)
+  local env = envelope_at(ti, name_or_index)
+  points = points or {}
+  reaper.DeleteEnvelopePointRange(env, -math.huge, math.huge)
+  for _, p in ipairs(points) do
+    reaper.InsertEnvelopePoint(env, beats_to_time(p.beats or p.time or 0),
+      p.value or 0, p.shape or 0, p.tension or 0, p.selected and true or false, true)
+  end
+  reaper.Envelope_SortPoints(env)
+  reaper.UpdateArrange()
+  return { ret = { n_points = reaper.CountEnvelopePoints(env) } }
+end
+
 function DSL.set_time_selection(sb, eb)
   reaper.GetSet_LoopTimeRange(true, false, beats_to_time(sb), beats_to_time(eb), false)
   return { ret = { start_beats = sb, end_beats = eb } }
@@ -586,12 +790,45 @@ function DSL.add_marker(pos_beats, name, is_region, end_beats)
   return { ret = { marker_index = idx } }
 end
 
-function DSL.render_project(path)
+function DSL.render_project(path, opts)
+  opts = opts or {}
   if path and path ~= "" then
     reaper.GetSetProjectInfo_String(0, "RENDER_FILE", path, true)
   end
+  local bounds = opts.bounds or "project"
+  local flag = 1
+  if bounds == "custom" then flag = 0
+  elseif bounds == "time_selection" then flag = 2
+  elseif bounds == "items" then flag = 3
+  end
+  reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", flag, true)
+  if bounds == "custom" then
+    reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", beats_to_time(opts.start_beats or 0), true)
+    reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", beats_to_time(opts.end_beats or 0), true)
+  end
+  if opts.sample_rate then
+    reaper.GetSetProjectInfo(0, "RENDER_SRATE", opts.sample_rate, true)
+  end
+  if opts.channels then
+    reaper.GetSetProjectInfo(0, "RENDER_CHANNELS", opts.channels, true)
+  end
+  local settings = 1
+  if opts.stems then
+    settings = 8
+    if opts.track_indices then
+      reaper.Main_OnCommand(40297, 0)
+      for _, i in ipairs(opts.track_indices) do
+        local tr = track_at(i)
+        reaper.SetTrackSelected(tr, true)
+      end
+    end
+  end
+  reaper.GetSetProjectInfo(0, "RENDER_SETTINGS", settings, true)
+  if opts.pattern and opts.pattern ~= "" then
+    reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", opts.pattern, true)
+  end
   reaper.Main_OnCommand(42230, 0)
-  return { ret = { rendered_to = path or "(project render path)" } }
+  return { ret = { rendered_to = path or "(project render path)", bounds = bounds, stems = opts.stems and true or false } }
 end
 
 function DSL.create_bus(name, source_indices)
@@ -679,6 +916,7 @@ reaper.RecursiveCreateDirectory(DIR, 0)
 os.remove(REQ)
 os.remove(RESP)
 os.remove(TMP)
+os.remove(BUSY)
 touch_heartbeat()
 reaper.ShowConsoleMsg("reaper-mcp bridge " .. VERSION .. " ready\n  " .. DIR .. "\n")
 
@@ -688,6 +926,9 @@ local function tick()
     local raw = read_file(REQ)
     os.remove(REQ)
     if raw then
+      local bf = io.open(BUSY, "wb")
+      if bf then bf:write("1") bf:close() end
+      touch_heartbeat()
       log("REQ: " .. raw)
       local req, derr = json.decode(raw)
       local resp
@@ -702,6 +943,8 @@ local function tick()
       local out = json.encode(resp)
       log("RESP: " .. out)
       write_atomic(RESP, out, TMP)
+      os.remove(BUSY)
+      touch_heartbeat()
     end
   end
   reaper.defer(tick)
