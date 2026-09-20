@@ -16,6 +16,29 @@ ROOT = os.path.dirname(HERE)
 SERVER = os.path.join(HERE, "server.py")
 BRIDGE = os.path.join(ROOT, "lua", "bridge.lua")
 
+sys.path.insert(0, ROOT)
+
+
+def check_batch_timeout():
+    """A batch containing a render must inherit the render budget."""
+    from reaper_mcp import server
+
+    calls, timeout = server._normalize_batch([
+        {"func": "track", "action": "add", "name": "Pad"},
+    ])
+    assert calls == [{"func": "add_track", "args": ["Pad", None]}], calls
+    assert timeout is None, timeout
+
+    calls, timeout = server._normalize_batch([
+        {"func": "track", "action": "add", "name": "Pad"},
+        {"func": "render", "arguments": {"path": "/tmp/x.wav"}},
+    ])
+    assert timeout == server.RENDER_TIMEOUT, timeout
+
+    calls, timeout = server._normalize_batch([{"func": "render_project", "args": ["/tmp/x.wav"]}])
+    assert timeout == server.RENDER_TIMEOUT, timeout
+    return True
+
 
 def fake_bridge(bridge_dir, stop):
     req = os.path.join(bridge_dir, "request.json")
@@ -108,6 +131,7 @@ def main():
         check("MIDI undo uses OnStateChange_Item",
               "Undo_OnStateChange_Item" in src)
         check("APPDATA mailbox", "reaper-mcp" in src and "APPDATA" in src)
+        check("batch inherits the render timeout", check_batch_timeout())
 
         r = rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         check("initialize", r["result"]["serverInfo"]["name"] == "reaper-mcp")

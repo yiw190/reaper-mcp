@@ -218,15 +218,16 @@ local function write_atomic(final, content, tmp)
   return true
 end
 
-local function file_exists(p)
-  local f = io.open(p, "rb")
-  if f then f:close() return true end
-  return false
-end
-
-local function touch_heartbeat()
+-- Python treats a heartbeat older than REAPER_MCP_HEARTBEAT_STALE (5s) as a dead
+-- bridge, so 0.5s is plenty. Rewriting it every defer tick was pure idle I/O.
+local HEARTBEAT_INTERVAL = 0.5
+local last_heartbeat = -math.huge
+local function touch_heartbeat(force)
+  local now = reaper.time_precise()
+  if not force and (now - last_heartbeat) < HEARTBEAT_INTERVAL then return end
+  last_heartbeat = now
   local f = io.open(HEART, "wb")
-  if f then f:write(tostring(reaper.time_precise())) f:close() end
+  if f then f:write(tostring(now)) f:close() end
 end
 
 ----------------------------------------------------------------------
@@ -278,6 +279,31 @@ local MIDI_FUNCS = {
   update_midi_note = true, delete_midi_notes = true,
 }
 
+-- A batch used to pay one arrange/timeline/layout refresh per sub-call. Coalesce
+-- them: while a batch is running the requests are only recorded, and one real
+-- refresh of each kind happens when the outermost batch finishes.
+local batch_depth = 0
+local pending_arrange, pending_tracks, pending_timeline = false, false, false
+
+local function refresh_arrange()
+  if batch_depth > 0 then pending_arrange = true else reaper.UpdateArrange() end
+end
+
+local function refresh_tracks()
+  if batch_depth > 0 then pending_tracks = true else reaper.TrackList_AdjustWindows(false) end
+end
+
+local function refresh_timeline()
+  if batch_depth > 0 then pending_timeline = true else reaper.UpdateTimeline() end
+end
+
+local function flush_refresh()
+  if batch_depth > 0 then return end
+  if pending_arrange then pending_arrange = false reaper.UpdateArrange() end
+  if pending_tracks then pending_tracks = false reaper.TrackList_AdjustWindows(false) end
+  if pending_timeline then pending_timeline = false reaper.UpdateTimeline() end
+end
+
 local function vol_db(t)
   local vol = reaper.GetMediaTrackInfo_Value(t, "D_VOL")
   if vol <= 0 then return -150 end
@@ -321,19 +347,19 @@ end
 function DSL.add_track(name, index)
   index = index or reaper.CountTracks(0)
   reaper.InsertTrackAtIndex(index, true)
-  reaper.TrackList_AdjustWindows(false)
+  refresh_tracks()
   local t = reaper.GetTrack(0, index)
   if name and name ~= "" then
     reaper.GetSetMediaTrackInfo_String(t, "P_NAME", name, true)
   end
-  reaper.UpdateArrange()
+  refresh_arrange()
   return { ret = { index = index, name = name or "" } }
 end
 
 function DSL.delete_track(index)
   if index == -1 then error("cannot delete the master track") end
   reaper.DeleteTrack(track_at(index))
-  reaper.UpdateArrange()
+  refresh_arrange()
   return { ret = true }
 end
 
@@ -355,7 +381,7 @@ function DSL.update_track(index, props)
   if props.solo ~= nil then
     reaper.SetMediaTrackInfo_Value(t, "I_SOLO", props.solo and 1 or 0)
   end
-  reaper.UpdateArrange()
+  refresh_arrange()
   return { ret = true }
 end
 
@@ -367,7 +393,7 @@ end
 function DSL.set_time_signature(num, denom)
   reaper.SetTempoTimeSigMarker(0, -1, 0, -1, -1, reaper.Master_GetTempo(),
     num, denom, false)
-  reaper.UpdateTimeline()
+  refresh_timeline()
   return { ret = { num = num, denom = denom } }
 end
 
@@ -393,11 +419,17 @@ function DSL.create_midi_item(ti, start_beats, length_beats)
   local e = beats_to_time((start_beats or 0) + (length_beats or 4))
   local item = reaper.CreateNewMIDIItemInProj(t, s, e, false)
   reaper.SetMediaItemInfo_Value(item, "B_LOOPSRC", 0)
-  local idx = -1
-  for i = 0, reaper.CountTrackMediaItems(t) - 1 do
-    if reaper.GetTrackMediaItem(t, i) == item then idx = i break end
+  -- IP_ITEMNUMBER is the item's index inside its track, so this replaces a scan
+  -- of every item on the track. Verify it, since the property is a fallback 0 on
+  -- builds that do not know it.
+  local idx = math.floor(reaper.GetMediaItemInfo_Value(item, "IP_ITEMNUMBER"))
+  if not (idx >= 0 and reaper.GetTrackMediaItem(t, idx) == item) then
+    idx = -1
+    for i = 0, reaper.CountTrackMediaItems(t) - 1 do
+      if reaper.GetTrackMediaItem(t, i) == item then idx = i break end
+    end
   end
-  reaper.UpdateArrange()
+  refresh_arrange()
   return { ret = {
     item_index = idx, handle = to_handle(item),
     start_beats = start_beats or 0, length_beats = length_beats or 4,
@@ -437,7 +469,9 @@ end
 local function extend_item_to_notes(take, notes)
   local max_qn
   for _, nt in ipairs(notes or {}) do
-    local e = (nt.start_beats or 0) + (nt.length_beats or 0)
+    -- Same 1-beat default as insert_notes, so a note without length_beats is
+    -- covered by the item extension instead of hanging past its end.
+    local e = (nt.start_beats or 0) + (nt.length_beats or 1)
     if not max_qn or e > max_qn then max_qn = e end
   end
   if not max_qn then return false end
@@ -464,7 +498,7 @@ function DSL.add_midi_notes(ti, ii, notes)
   reaper.MIDI_Sort(take)
   local extended = extend_item_to_notes(take, notes)
   record_item_undo(take, "MCP: add MIDI notes")
-  reaper.UpdateArrange()
+  refresh_arrange()
   return { ret = { inserted = count, item_extended = extended } }
 end
 
@@ -494,7 +528,7 @@ function DSL.replace_midi_notes(ti, ii, notes)
   reaper.MIDI_Sort(take)
   local extended = extend_item_to_notes(take, notes)
   record_item_undo(take, "MCP: replace MIDI notes")
-  reaper.UpdateArrange()
+  refresh_arrange()
   return { ret = { inserted = count, item_extended = extended } }
 end
 
@@ -506,17 +540,21 @@ function DSL.update_midi_note(ti, ii, note_index, changes)
   end
   local _, _, muted, sppq, eppq, chan, pitch, vel = reaper.MIDI_GetNote(take, note_index)
   local ch = changes or {}
-  local start_qn = ch.start_beats or reaper.MIDI_GetProjQNFromPPQPos(take, sppq)
+  local orig_start_qn = reaper.MIDI_GetProjQNFromPPQPos(take, sppq)
+  local start_qn = ch.start_beats or orig_start_qn
   local end_qn = start_qn + (ch.length_beats or (
-    reaper.MIDI_GetProjQNFromPPQPos(take, eppq) - reaper.MIDI_GetProjQNFromPPQPos(take, sppq)))
-  reaper.MIDI_SetNote(take, note_index, nil,
-    ch.muted ~= nil and ch.muted or muted,
+    reaper.MIDI_GetProjQNFromPPQPos(take, eppq) - orig_start_qn))
+  local new_muted = muted
+  if ch.muted ~= nil then new_muted = ch.muted and true or false end
+  -- noSort here, then one explicit sort below: MIDI_SetNote used to sort as well,
+  -- which sorted the whole event list twice per note.
+  reaper.MIDI_SetNote(take, note_index, nil, new_muted,
     reaper.MIDI_GetPPQPosFromProjQN(take, start_qn),
     reaper.MIDI_GetPPQPosFromProjQN(take, end_qn),
-    ch.channel or chan, ch.pitch or pitch, ch.velocity or vel, false)
+    ch.channel or chan, ch.pitch or pitch, ch.velocity or vel, true)
   reaper.MIDI_Sort(take)
   record_item_undo(take, "MCP: update MIDI note")
-  reaper.UpdateArrange()
+  refresh_arrange()
   return { ret = true }
 end
 
@@ -526,7 +564,7 @@ function DSL.delete_midi_notes(ti, ii, indices)
   for _, i in ipairs(indices) do reaper.MIDI_DeleteNote(take, i) end
   reaper.MIDI_Sort(take)
   record_item_undo(take, "MCP: delete MIDI notes")
-  reaper.UpdateArrange()
+  refresh_arrange()
   return { ret = { deleted = #indices } }
 end
 
@@ -673,12 +711,13 @@ function DSL.list_items(ti)
     local item = reaper.GetTrackMediaItem(t, i)
     local vol = reaper.GetMediaItemInfo_Value(item, "D_VOL")
     local db = (vol <= 0) and -150 or (20 * math.log(vol) / math.log(10))
+    local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local pos_beats = time_to_beats(pos)
     out[#out + 1] = {
       item_index = i,
-      position_beats = time_to_beats(reaper.GetMediaItemInfo_Value(item, "D_POSITION")),
-      length_beats = time_to_beats(reaper.GetMediaItemInfo_Value(item, "D_POSITION")
-        + reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
-        - time_to_beats(reaper.GetMediaItemInfo_Value(item, "D_POSITION")),
+      position_beats = pos_beats,
+      length_beats = time_to_beats(pos + reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
+        - pos_beats,
       gain_db = db,
       fade_in = reaper.GetMediaItemInfo_Value(item, "D_FADEINLEN"),
       fade_out = reaper.GetMediaItemInfo_Value(item, "D_FADEOUTLEN"),
@@ -716,7 +755,7 @@ function DSL.update_item(ti, ii, props)
     local pos_b = time_to_beats(pos)
     reaper.SetMediaItemLength(item, beats_to_time(pos_b + props.length_beats) - pos, false)
   end
-  reaper.UpdateArrange()
+  refresh_arrange()
   return { ret = true }
 end
 
@@ -772,7 +811,7 @@ function DSL.set_envelope(ti, name_or_index, points)
       p.value or 0, p.shape or 0, p.tension or 0, p.selected and true or false, true)
   end
   reaper.Envelope_SortPoints(env)
-  reaper.UpdateArrange()
+  refresh_arrange()
   return { ret = { n_points = reaper.CountEnvelopePoints(env) } }
 end
 
@@ -786,7 +825,7 @@ function DSL.add_marker(pos_beats, name, is_region, end_beats)
     beats_to_time(pos_beats),
     is_region and beats_to_time(end_beats or pos_beats) or 0,
     name or "", -1, 0)
-  reaper.UpdateTimeline()
+  refresh_timeline()
   return { ret = { marker_index = idx } }
 end
 
@@ -841,18 +880,25 @@ function DSL.create_bus(name, source_indices)
     local src = track_at(i)
     reaper.CreateTrackSend(src, bus)
   end
-  reaper.TrackList_AdjustWindows(false)
-  reaper.UpdateArrange()
+  refresh_tracks()
+  refresh_arrange()
   return { ret = { index = bus_index, name = name or "Bus" } }
 end
 
 function DSL.batch(calls)
   local results = {}
-  for i = 1, #(calls or {}) do
-    local ok, r = pcall(dispatch, calls[i])
-    if ok then results[i] = r
-    else results[i] = { ok = false, error = tostring(r) } end
-  end
+  batch_depth = batch_depth + 1
+  local ok, err = pcall(function()
+    for i = 1, #(calls or {}) do
+      local cok, r = pcall(dispatch, calls[i])
+      if cok then results[i] = r
+      else results[i] = { ok = false, error = tostring(r) } end
+    end
+  end)
+  batch_depth = batch_depth - 1
+  -- Always release the refresh lock, even when the batch blew up halfway.
+  flush_refresh()
+  if not ok then error(err) end
   return { ret = results }
 end
 
@@ -884,7 +930,9 @@ dispatch = function(req)
     if MIDI_FUNCS[func] or func == "batch" or func == "ping"
         or func == "get_project_summary" or func == "list_tracks"
         or func == "get_midi_notes" or func == "list_track_fx"
-        or func == "get_fx_params" then
+        or func == "get_fx_params" or func == "list_sends"
+        or func == "list_items" or func == "list_envelopes"
+        or func == "get_envelope" then
       return run()
     end
     reaper.Undo_BeginBlock()
@@ -922,30 +970,28 @@ reaper.ShowConsoleMsg("reaper-mcp bridge " .. VERSION .. " ready\n  " .. DIR .. 
 
 local function tick()
   touch_heartbeat()
-  if file_exists(REQ) then
-    local raw = read_file(REQ)
+  local raw = read_file(REQ)
+  if raw then
     os.remove(REQ)
-    if raw then
-      local bf = io.open(BUSY, "wb")
-      if bf then bf:write("1") bf:close() end
-      touch_heartbeat()
-      log("REQ: " .. raw)
-      local req, derr = json.decode(raw)
-      local resp
-      if not req then
-        resp = { ok = false, error = "bad request json: " .. tostring(derr) }
-      else
-        local ok, r = pcall(dispatch, req)
-        if ok then resp = r
-        else resp = { ok = false, error = "bridge error: " .. tostring(r) } end
-        resp.id = req.id
-      end
-      local out = json.encode(resp)
-      log("RESP: " .. out)
-      write_atomic(RESP, out, TMP)
-      os.remove(BUSY)
-      touch_heartbeat()
+    local bf = io.open(BUSY, "wb")
+    if bf then bf:write("1") bf:close() end
+    touch_heartbeat(true)
+    if DEBUG then log("REQ: " .. raw) end
+    local req, derr = json.decode(raw)
+    local resp
+    if not req then
+      resp = { ok = false, error = "bad request json: " .. tostring(derr) }
+    else
+      local ok, r = pcall(dispatch, req)
+      if ok then resp = r
+      else resp = { ok = false, error = "bridge error: " .. tostring(r) } end
+      resp.id = req.id
     end
+    local out = json.encode(resp)
+    if DEBUG then log("RESP: " .. out) end
+    write_atomic(RESP, out, TMP)
+    os.remove(BUSY)
+    touch_heartbeat(true)
   end
   reaper.defer(tick)
 end

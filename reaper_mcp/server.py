@@ -24,7 +24,11 @@ PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "reaper-mcp"
 SERVER_VERSION = "0.1.0"
 HEARTBEAT_STALE = float(os.environ.get("REAPER_MCP_HEARTBEAT_STALE", "5"))
-POLL = 0.015
+POLL = float(os.environ.get("REAPER_MCP_POLL", "0.015"))
+# A fast bridge answers inside the first few milliseconds, so poll tightly at
+# first and fall back to POLL for the wait (and for lock contention).
+FAST_POLL = 0.002
+FAST_POLL_WINDOW = 0.25
 RENDER_TIMEOUT = float(os.environ.get("REAPER_MCP_RENDER_TIMEOUT", "300"))
 
 INSTRUCTIONS = (
@@ -61,6 +65,10 @@ def _is_wsl() -> bool:
 
 class BridgeError(Exception):
     pass
+
+
+def _poll_wait(started: float) -> float:
+    return FAST_POLL if (time.monotonic() - started) < FAST_POLL_WINDOW else POLL
 
 
 class Bridge:
@@ -166,16 +174,17 @@ class Bridge:
                 json.dump(payload, f)
             os.replace(tmp, self.req)
 
+            started = time.monotonic()
             while time.time() < deadline:
                 if os.path.exists(self.resp):
                     try:
                         with open(self.resp, encoding="utf-8") as f:
                             data = json.loads(f.read())
                     except (OSError, ValueError):
-                        time.sleep(POLL)
+                        time.sleep(_poll_wait(started))
                         continue
                     if data.get("id") not in (rid, None):
-                        time.sleep(POLL)
+                        time.sleep(_poll_wait(started))
                         continue
                     try:
                         os.remove(self.resp)
@@ -184,7 +193,7 @@ class Bridge:
                     if not data.get("ok", False):
                         raise BridgeError(data.get("error", "unknown bridge error"))
                     return data.get("ret")
-                time.sleep(POLL)
+                time.sleep(_poll_wait(started))
             raise BridgeError(
                 "Timed out waiting for REAPER. Is lua/bridge.lua running?"
             )
@@ -514,22 +523,35 @@ tool(
         "action": {"type": "string"}},
         ["func"])}},
         ["calls"]),
-    lambda b, a: b.call("batch", [_normalize_batch(a["calls"])]),
+    lambda b, a: _build_batch(b, a),
 )
 
 
+def _build_batch(bridge, a):
+    calls, timeout = _normalize_batch(a["calls"])
+    return bridge.call("batch", [calls], timeout=timeout)
+
+
 def _expand_grouped(func, arguments):
-    """Turn a grouped MCP tool invocation into a DSL/bridge call."""
+    """Turn a grouped MCP tool invocation into a DSL/bridge call.
+
+    Returns (call, timeout); a batch of renders needs the render budget, not the
+    ordinary bridge timeout.
+    """
     spec = TOOL_INDEX.get(func)
     if spec is None or func in ("batch", "reaper_call", "run_lua"):
-        return None
+        return None, None
     capture = _BatchCapture()
-    return spec["_builder"](capture, arguments)
+    return spec["_builder"](capture, arguments), capture.timeout
 
 
 class _BatchCapture:
+    def __init__(self) -> None:
+        self.timeout = None
+
     def call(self, func, args=None, code=None, timeout=None):
-        del timeout
+        if timeout is not None:
+            self.timeout = (self.timeout or 0.0) + timeout
         call = {"func": func}
         if code is not None:
             call["code"] = code
@@ -540,6 +562,7 @@ class _BatchCapture:
 
 def _normalize_batch(calls):
     out = []
+    timeout = None
     for original in calls:
         call = dict(original)
         func = call.get("func")
@@ -547,13 +570,18 @@ def _normalize_batch(calls):
         if arguments is None and "action" in call:
             arguments = {k: v for k, v in call.items() if k != "func"}
         expanded = None
+        call_timeout = None
         if isinstance(arguments, dict):
-            expanded = _expand_grouped(func, arguments)
+            expanded, call_timeout = _expand_grouped(func, arguments)
         if expanded is not None:
             out.append(expanded)
         else:
             out.append(call)
-    return out
+            if func == "render_project":
+                call_timeout = RENDER_TIMEOUT
+        if call_timeout:
+            timeout = (timeout or 0.0) + call_timeout
+    return out, timeout
 
 
 TOOL_INDEX = {t["name"]: t for t in TOOLS}
@@ -600,7 +628,8 @@ def handle_request(bridge, msg):
             return make_error(rid, -32602, f"unknown tool: {name}")
         try:
             ret = spec["_builder"](bridge, args)
-            text = json.dumps(ret, ensure_ascii=False, indent=2) if not isinstance(ret, str) else ret
+            text = json.dumps(ret, ensure_ascii=False, separators=(",", ":")) \
+                if not isinstance(ret, str) else ret
             return make_result(rid, {
                 "content": [{"type": "text", "text": text}],
                 "isError": False,

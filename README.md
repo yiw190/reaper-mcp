@@ -50,10 +50,11 @@ Mailbox is `%APPDATA%/reaper-mcp/ipc` (ASCII path both sides derive). Time is **
 ## Tests
 
 ```
-python3 python/test_server.py
+python3 python/test_server.py                        # MCP server + fake bridge
+uv run --with lupa python python/test_bridge_lua.py  # bridge.lua against a fake ReaScript API
 ```
 
-Fake bridge, no REAPER.
+Neither needs REAPER. The second one skips if lupa is not installed.
 
 ## License
 
