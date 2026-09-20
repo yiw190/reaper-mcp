@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>reaper-mcp</title>
+  <defs>
+    <clipPath id="squircle"><rect x="0" y="0" width="1024" height="1024" rx="196" ry="196"/></clipPath>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2A2024"/>
+      <stop offset="1" stop-color="#1A1416"/>
+    </linearGradient>
+  </defs>
+  <g clip-path="url(#squircle)">
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#bg)"/>
+    <g fill="none" stroke="#63CBF9" stroke-width="54" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 268 273 L 106 512 L 268 751"/>
+      <path d="M 268 273 L 106 512 L 268 751" transform="translate(1024,0) scale(-1,1)"/>
+    </g>
+  <rect x="252.0" y="421.5" width="52" height="181" rx="26.0" fill="#63CBF9"/>
+  <rect x="330.0" y="376.5" width="52" height="271" rx="26.0" fill="#63CBF9"/>
+  <rect x="407.0" y="330.5" width="52" height="363" rx="26.0" fill="#63CBF9"/>
+  <rect x="485.0" y="294.0" width="52" height="436" rx="26.0" fill="#63CBF9"/>
+  <rect x="563.0" y="330.5" width="52" height="363" rx="26.0" fill="#63CBF9"/>
+  <rect x="640.0" y="376.5" width="52" height="271" rx="26.0" fill="#63CBF9"/>
+  <rect x="718.0" y="421.5" width="52" height="181" rx="26.0" fill="#63CBF9"/>
+  </g>
+</svg>

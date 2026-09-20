@@ -1,8 +1,10 @@
 # reaper-mcp
 
-[![ci](https://github.com/yiw190/reaper-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/yiw190/reaper-mcp/actions/workflows/ci.yml)
+<img src="icons/reaper-mcp.svg" alt="" width="96" height="96" align="left" hspace="12" vspace="4">
 
 MCP server for [REAPER](https://reaper.fm).
+
+[![ci](https://github.com/yiw190/reaper-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/yiw190/reaper-mcp/actions/workflows/ci.yml)
 
 ```
 MCP client  --stdio JSON-RPC-->  python/server.py  --JSON mailbox-->  lua/bridge.lua (inside REAPER)
