@@ -22,7 +22,7 @@ else:
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "reaper-mcp"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 HEARTBEAT_STALE = float(os.environ.get("REAPER_MCP_HEARTBEAT_STALE", "5"))
 POLL = float(os.environ.get("REAPER_MCP_POLL", "0.015"))
 # A fast bridge answers inside the first few milliseconds, so poll tightly at
@@ -299,7 +299,8 @@ tool(
     "MIDI on a track item. Times are absolute project beats. "
     "action: create_item | add | get | replace | update | delete | cc. "
     "replace rewrites the whole take in one undo step; add only appends. "
-    "cc inserts CC (`cc`+`value`) or program change (`program`) via ccs[].",
+    "cc inserts CC (`cc`+`value`) or program change (`program`) via ccs[]. "
+    "get omits index (use array offset), channel if 0, muted/selected if false.",
     obj({
         "action": {"type": "string",
                    "enum": ["create_item", "add", "get", "replace", "update", "delete", "cc"]},
@@ -542,7 +543,8 @@ tool(
     "batch",
     "Many operations in one IPC hop. Each call is {func, args} or {func, code} "
     "or {func, arguments} for a grouped tool name (track/midi/fx/...). "
-    "One failure does not abort the rest. Handles from earlier calls work later.",
+    "Each slot is the inner result, or {error}. One failure does not abort the rest. "
+    "Handles from earlier calls work later.",
     obj({"calls": {"type": "array", "items": obj({
         "func": {"type": "string"},
         "args": {"type": "array"},
@@ -660,16 +662,15 @@ def handle_request(bridge, msg):
                 if not isinstance(ret, str) else ret
             return make_result(rid, {
                 "content": [{"type": "text", "text": text}],
-                "isError": False,
             })
         except BridgeError as e:
             return make_result(rid, {
-                "content": [{"type": "text", "text": f"REAPER error: {e}"}],
+                "content": [{"type": "text", "text": str(e)}],
                 "isError": True,
             })
         except Exception as e:  # noqa: BLE001
             return make_result(rid, {
-                "content": [{"type": "text", "text": f"Server error: {e}"}],
+                "content": [{"type": "text", "text": str(e)}],
                 "isError": True,
             })
     if rid is None:

@@ -9,7 +9,7 @@
   Load via Actions > Load ReaScript and keep it running.
 ]]
 
-local VERSION = "0.2.0"
+local VERSION = "0.3.0"
 local DEBUG = (os.getenv and os.getenv("REAPER_MCP_DEBUG") == "1") or false
 
 local function log(s)
@@ -378,7 +378,6 @@ function DSL.get_project_summary()
     cursor_seconds = reaper.GetCursorPosition(),
     track_count = n,
     tracks = tracks,
-    ipc = DIR,
   } }
 end
 
@@ -541,7 +540,9 @@ function DSL.add_midi_notes(ti, ii, notes)
   local extended = extend_item_to_notes(take, notes)
   record_item_undo(take, "MCP: add MIDI notes")
   refresh_arrange()
-  return { ret = { inserted = count, item_extended = extended } }
+  local ret = { inserted = count }
+  if extended then ret.item_extended = true end
+  return { ret = ret }
 end
 
 function DSL.get_midi_notes(ti, ii)
@@ -552,11 +553,14 @@ function DSL.get_midi_notes(ti, ii)
     local _, sel, muted, sppq, eppq, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
     local sqn = reaper.MIDI_GetProjQNFromPPQPos(take, sppq)
     local eqn = reaper.MIDI_GetProjQNFromPPQPos(take, eppq)
-    notes[#notes + 1] = {
-      index = i, pitch = pitch, velocity = vel, channel = chan,
-      selected = sel, muted = muted,
+    local n = {
+      pitch = pitch, velocity = vel,
       start_beats = sqn, length_beats = eqn - sqn,
     }
+    if chan ~= 0 then n.channel = chan end
+    if muted then n.muted = true end
+    if sel then n.selected = true end
+    notes[#notes + 1] = n
   end
   return { ret = notes }
 end
@@ -571,7 +575,9 @@ function DSL.replace_midi_notes(ti, ii, notes)
   local extended = extend_item_to_notes(take, notes)
   record_item_undo(take, "MCP: replace MIDI notes")
   refresh_arrange()
-  return { ret = { inserted = count, item_extended = extended } }
+  local ret = { inserted = count }
+  if extended then ret.item_extended = true end
+  return { ret = ret }
 end
 
 function DSL.update_midi_note(ti, ii, note_index, changes)
@@ -1014,8 +1020,13 @@ function DSL.batch(calls)
   local ok, err = pcall(function()
     for i = 1, #(calls or {}) do
       local cok, r = pcall(dispatch, calls[i])
-      if cok then results[i] = r
-      else results[i] = { ok = false, error = tostring(r) } end
+      if not cok then
+        results[i] = { error = tostring(r) }
+      elseif r and r.ok == false then
+        results[i] = { error = r.error or "error" }
+      else
+        results[i] = r and r.ret
+      end
     end
   end)
   batch_depth = batch_depth - 1
@@ -1028,15 +1039,22 @@ end
 ----------------------------------------------------------------------
 -- Dispatch
 ----------------------------------------------------------------------
+local function tidy_err(msg)
+  msg = tostring(msg or "")
+  msg = msg:gsub('%[string "mcp_run_lua"%]:', "lua:")
+  msg = msg:gsub("^bridge error: ", "")
+  return msg
+end
+
 dispatch = function(req)
   local func = req.func
   if func == "run_lua" then
     local chunk, cerr = load(req.code, "mcp_run_lua", "t",
       setmetatable({ reaper = reaper, json = json, to_handle = to_handle,
                      handles = handles }, { __index = _G }))
-    if not chunk then return { ok = false, error = "compile error: " .. tostring(cerr) } end
+    if not chunk then return { ok = false, error = tidy_err(cerr) } end
     local ok, ret = pcall(chunk)
-    if not ok then return { ok = false, error = "runtime error: " .. tostring(ret) } end
+    if not ok then return { ok = false, error = tidy_err(ret) } end
     return { ok = true, ret = ret }
   end
 
@@ -1107,7 +1125,7 @@ local function tick()
     else
       local ok, r = pcall(dispatch, req)
       if ok then resp = r
-      else resp = { ok = false, error = "bridge error: " .. tostring(r) } end
+      else resp = { ok = false, error = tidy_err(r) } end
       resp.id = req.id
     end
     local out = json.encode(resp)

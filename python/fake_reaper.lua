@@ -92,6 +92,7 @@ reaper.TrackList_AdjustWindows = function() hit("TrackList_AdjustWindows") end
 reaper.UpdateArrange = function() hit("UpdateArrange") end
 reaper.UpdateTimeline = function() hit("UpdateTimeline") end
 reaper.Main_GetTempo = function() return 120.0 end
+reaper.Master_GetTempo = function() return 120.0 end
 reaper.GetPlayState = function() return 0 end
 reaper.GetCursorPosition = function() return 0.0 end
 reaper.EnumProjects = function() return 0, "" end

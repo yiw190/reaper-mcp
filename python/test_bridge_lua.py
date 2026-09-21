@@ -204,6 +204,28 @@ def main() -> None:
     check("cc 64 value 127", int(cc64["chanmsg"]) == 0xB0 and int(cc64["msg2"]) == 64 and int(cc64["msg3"]) == 127, dict(cc64))
     check("add_midi_cc sorts once", count("MIDI_Sort") == 1, f"sort={count('MIDI_Sort')}")
 
+    # --- compact payloads ----------------------------------------------
+    seeded_track(0)
+    r = rpc("get_midi_notes", [0, 0])
+    n0 = r["ret"][0]
+    check("get omits index", "index" not in n0, n0)
+    check("get omits channel 0", "channel" not in n0, n0)
+    check("get omits selected false", "selected" not in n0, n0)
+    check("get keeps muted true", n0.get("muted") is True, n0)
+
+    r = rpc("get_project_summary")
+    check("status has no ipc", r.get("ok") and "ipc" not in r["ret"], r)
+
+    r = rpc("batch", [[{"func": "ping"}]])
+    inner = r["ret"][0]
+    check("batch unwraps ret", isinstance(inner, dict) and inner.get("pong") is True, inner)
+    check("batch has no ok/ret shell", "ret" not in inner and "ok" not in inner, inner)
+
+    r = rpc("run_lua", code="this is not lua !!!")
+    err = r.get("error") or ""
+    check("error has no bridge prefix", r.get("ok") is False and "bridge error" not in err, err)
+    check("error strips chunk name", "mcp_run_lua" not in err, err)
+
     # --- import media ---------------------------------------------------
     clear()
     n_before = len(g.tracks)

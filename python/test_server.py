@@ -134,7 +134,7 @@ def fake_bridge(bridge_dir, stop):
                 ret = 1
             elif func == "batch":
                 calls = payload["args"][0]
-                ret = [{"ok": True, "ret": {"echo": c.get("func"), "args": c.get("args")}}
+                ret = [{"echo": c.get("func"), "args": c.get("args")}
                        for c in calls]
             elif func == "CountTracks":
                 ret = 3
@@ -232,12 +232,12 @@ def main():
                            ]}}})
         body = json.loads(r["result"]["content"][0]["text"])
         check("batch expands grouped tools",
-              body[0]["ret"]["echo"] == "add_track")
-        check("batch keeps run_lua", body[1]["ret"]["echo"] == "run_lua")
+              body[0]["echo"] == "add_track")
+        check("batch keeps run_lua", body[1]["echo"] == "run_lua")
 
         r = rpc(proc, {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
                        "params": {"name": "run_lua", "arguments": {"code": "slow"}}})
-        check("busy bridge is not stale", r["result"]["isError"] is False)
+        check("busy bridge is not stale", not r["result"].get("isError"))
 
         r = rpc(proc, {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
                        "params": {"name": "status", "arguments": {}}})
