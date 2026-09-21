@@ -190,6 +190,40 @@ def main() -> None:
     rpc("update_track", [0, {"volume_db": -2}])
     check("mutating op keeps its undo block", count("Undo_BeginBlock") == 1)
 
+    # --- midi CC / program change --------------------------------------
+    seeded_track(0)
+    clear()
+    r = rpc("add_midi_cc", [0, 0, [
+        {"start_beats": 0, "program": 33, "channel": 1},
+        {"start_beats": 0, "cc": 64, "value": 127, "channel": 0},
+    ]])
+    take_ccs = g.tracks[1]["items"][1]["ccs"]
+    pc, cc64 = take_ccs[1], take_ccs[2]
+    check("add_midi_cc ok", r.get("ok") and r["ret"]["inserted"] == 2, r)
+    check("program change is 0xC0", int(pc["chanmsg"]) == 0xC0 and int(pc["msg2"]) == 33, dict(pc))
+    check("cc 64 value 127", int(cc64["chanmsg"]) == 0xB0 and int(cc64["msg2"]) == 64 and int(cc64["msg3"]) == 127, dict(cc64))
+    check("add_midi_cc sorts once", count("MIDI_Sort") == 1, f"sort={count('MIDI_Sort')}")
+
+    # --- import media ---------------------------------------------------
+    clear()
+    n_before = len(g.tracks)
+    r = rpc("import_media", ["/tmp/x.mid", {"start_beats": 0, "as_new_track": True}])
+    check("import_media new track", r.get("ok") and len(g.tracks) == n_before + 1, r)
+    new_it = g.tracks[len(g.tracks)]["items"][1]
+    check("import_media clears loop source", new_it["loop"] is False, dict(new_it))
+
+    r = rpc("import_media", ["", {"track_index": 0}])
+    check("import_media rejects empty path", r.get("ok") is False, r)
+
+    # --- save project ---------------------------------------------------
+    clear()
+    r = rpc("save_project", [None])
+    check("save_project unsaved needs path", r.get("ok") is False, r)
+    r = rpc("save_project", ["/tmp/song.RPP"])
+    check("save_project copy", r.get("ok") and r["ret"]["copy"] is True, r)
+    check("save_project uses SaveProjectEx", count("Main_SaveProjectEx") == 1)
+    check("save_project skips undo block", count("Undo_BeginBlock") == 0)
+
     # --- idle heartbeat throttle --------------------------------------
     clear()
     g.pump(60)  # one second of idle ticks

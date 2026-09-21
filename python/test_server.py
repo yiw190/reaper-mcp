@@ -19,6 +19,52 @@ BRIDGE = os.path.join(ROOT, "lua", "bridge.lua")
 sys.path.insert(0, ROOT)
 
 
+def check_invalid_utf8_response():
+    """A mailbox reply with illegal UTF-8 must not look like a dead bridge."""
+    from reaper_mcp import server
+
+    bridge_dir = tempfile.mkdtemp(prefix="reaper_utf8_")
+    prev = os.environ.get("REAPER_MCP_IPC_DIR")
+    os.environ["REAPER_MCP_IPC_DIR"] = bridge_dir
+    try:
+        b = server.Bridge()
+        with open(b.heart, "w", encoding="utf-8") as f:
+            f.write("1")
+
+        def writer():
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                if os.path.exists(b.req):
+                    with open(b.req, encoding="utf-8") as f:
+                        payload = json.load(f)
+                    try:
+                        os.remove(b.req)
+                    except OSError:
+                        pass
+                    rid = payload.get("id", "")
+                    raw = (
+                        '{"id":"%s","ok":true,"ret":{"project":"波","tracks":[{"name":"Qq'
+                        % rid
+                    ).encode("utf-8") + bytes([0xD4]) + b'z"}]}}'
+                    with open(b.resp, "wb") as f:
+                        f.write(raw)
+                    return
+                time.sleep(0.01)
+
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+        ret = b.call("get_project_summary", timeout=3)
+        t.join(timeout=1)
+        assert ret["project"] == "波", ret
+        assert ret["tracks"][0]["name"].startswith("Qq"), ret
+        return True
+    finally:
+        if prev is None:
+            os.environ.pop("REAPER_MCP_IPC_DIR", None)
+        else:
+            os.environ["REAPER_MCP_IPC_DIR"] = prev
+
+
 def check_batch_timeout():
     """A batch containing a render must inherit the render budget."""
     from reaper_mcp import server
@@ -37,6 +83,18 @@ def check_batch_timeout():
 
     calls, timeout = server._normalize_batch([{"func": "render_project", "args": ["/tmp/x.wav"]}])
     assert timeout == server.RENDER_TIMEOUT, timeout
+
+    calls, timeout = server._normalize_batch([
+        {"func": "midi", "action": "cc", "track_index": 0, "item_index": 0,
+         "ccs": [{"start_beats": 0, "program": 0}]},
+        {"func": "item", "action": "import", "path": "/tmp/a.mid", "track_index": 0},
+        {"func": "project", "action": "save", "path": "/tmp/song.RPP"},
+    ])
+    assert calls[0]["func"] == "add_midi_cc", calls[0]
+    assert calls[1]["func"] == "import_media", calls[1]
+    assert calls[1]["args"][0] == "/tmp/a.mid", calls[1]
+    assert calls[1]["args"][1]["as_new_track"] is False, calls[1]
+    assert calls[2] == {"func": "save_project", "args": ["/tmp/song.RPP"]}, calls[2]
     return True
 
 
@@ -132,6 +190,9 @@ def main():
               "Undo_OnStateChange_Item" in src)
         check("APPDATA mailbox", "reaper-mcp" in src and "APPDATA" in src)
         check("batch inherits the render timeout", check_batch_timeout())
+        check("lua json encoder handles mixed utf-8",
+              "utf8_len" in src and "is_cont" in src)
+        check("python reads mailbox as utf-8 replace", check_invalid_utf8_response())
 
         r = rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         check("initialize", r["result"]["serverInfo"]["name"] == "reaper-mcp")

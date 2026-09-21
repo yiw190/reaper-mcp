@@ -9,7 +9,7 @@
   Load via Actions > Load ReaScript and keep it running.
 ]]
 
-local VERSION = "0.1.0"
+local VERSION = "0.2.0"
 local DEBUG = (os.getenv and os.getenv("REAPER_MCP_DEBUG") == "1") or false
 
 local function log(s)
@@ -55,10 +55,51 @@ do
     ['"'] = '\\"', ['\\'] = '\\\\', ['\b'] = '\\b', ['\f'] = '\\f',
     ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t',
   }
+  local function utf8_len(s, i)
+    local b = s:byte(i)
+    if not b then return nil end
+    if b < 0x80 then return 1 end
+    if b < 0xC2 then return nil end
+    if b < 0xE0 then return 2 end
+    if b < 0xF0 then return 3 end
+    if b < 0xF5 then return 4 end
+    return nil
+  end
+  local function is_cont(s, i)
+    local b = s:byte(i)
+    return b ~= nil and b >= 0x80 and b < 0xC0
+  end
   local function esc_str(s)
-    return '"' .. s:gsub('[%z\1-\31\\"]', function(c)
-      return esc[c] or string.format('\\u%04x', string.byte(c))
-    end) .. '"'
+    local parts = {'"'}
+    local i, n = 1, #s
+    while i <= n do
+      local b = s:byte(i)
+      if b < 32 or b == 34 or b == 92 then
+        local c = s:sub(i, i)
+        parts[#parts + 1] = esc[c] or string.format('\\u%04x', b)
+        i = i + 1
+      elseif b < 128 then
+        parts[#parts + 1] = s:sub(i, i)
+        i = i + 1
+      else
+        local len = utf8_len(s, i)
+        local ok = len ~= nil and (i + len - 1) <= n
+        if ok then
+          for j = i + 1, i + len - 1 do
+            if not is_cont(s, j) then ok = false break end
+          end
+        end
+        if ok then
+          parts[#parts + 1] = s:sub(i, i + len - 1)
+          i = i + len
+        else
+          parts[#parts + 1] = string.format('\\u%04x', b)
+          i = i + 1
+        end
+      end
+    end
+    parts[#parts + 1] = '"'
+    return table.concat(parts)
   end
   local encode
   local function is_array(t)
@@ -277,6 +318,7 @@ local DSL = {}
 local MIDI_FUNCS = {
   add_midi_notes = true, replace_midi_notes = true,
   update_midi_note = true, delete_midi_notes = true,
+  add_midi_cc = true,
 }
 
 -- A batch used to pay one arrange/timeline/layout refresh per sub-call. Coalesce
@@ -568,6 +610,39 @@ function DSL.delete_midi_notes(ti, ii, indices)
   return { ret = { deleted = #indices } }
 end
 
+local function validate_ccs(events)
+  if not events or #events == 0 then error("ccs array is empty") end
+  if #events > 10000 then error("refusing more than 10000 ccs in one call") end
+  for i, ev in ipairs(events) do
+    if type(ev) ~= "table" or type(ev.start_beats) ~= "number" then
+      error("cc #" .. i .. " needs numeric start_beats")
+    end
+    if ev.program == nil and ev.cc == nil then
+      error("cc #" .. i .. " needs cc or program")
+    end
+  end
+end
+
+function DSL.add_midi_cc(ti, ii, events)
+  local take = midi_take_at(ti, ii)
+  validate_ccs(events)
+  local count = 0
+  for _, ev in ipairs(events) do
+    local ppq = reaper.MIDI_GetPPQPosFromProjQN(take, ev.start_beats)
+    local chan = ev.channel or 0
+    if ev.program ~= nil then
+      reaper.MIDI_InsertCC(take, false, false, ppq, 0xC0, chan, ev.program, 0)
+    else
+      reaper.MIDI_InsertCC(take, false, false, ppq, 0xB0, chan, ev.cc, ev.value or 0)
+    end
+    count = count + 1
+  end
+  reaper.MIDI_Sort(take)
+  record_item_undo(take, "MCP: add MIDI CC")
+  refresh_arrange()
+  return { ret = { inserted = count } }
+end
+
 function DSL.add_track_fx(ti, fx_name)
   local t = track_at(ti)
   local fx = reaper.TrackFX_AddByName(t, fx_name, false, -1)
@@ -759,6 +834,41 @@ function DSL.update_item(ti, ii, props)
   return { ret = true }
 end
 
+function DSL.import_media(path, opts)
+  opts = opts or {}
+  local ti, start_beats, as_new_track = opts.track_index, opts.start_beats, opts.as_new_track
+  if type(path) ~= "string" or path == "" then error("path required") end
+  if start_beats ~= nil then
+    reaper.SetEditCurPos(beats_to_time(start_beats), false, false)
+  end
+  if not as_new_track then
+    if ti == nil then error("track_index required unless as_new_track") end
+    reaper.Main_OnCommand(40297, 0)
+    reaper.SetTrackSelected(track_at(ti), true)
+  end
+  local n_before = reaper.CountTracks(0)
+  local items_before = {}
+  for i = 0, n_before - 1 do
+    items_before[i] = reaper.CountTrackMediaItems(reaper.GetTrack(0, i))
+  end
+  local ok = reaper.InsertMedia(path, as_new_track and 1 or 0)
+  if ok == false then error("InsertMedia failed: " .. path) end
+  local created = {}
+  local n_after = reaper.CountTracks(0)
+  for i = 0, n_after - 1 do
+    local t = reaper.GetTrack(0, i)
+    local start_j = items_before[i] or 0
+    for j = start_j, reaper.CountTrackMediaItems(t) - 1 do
+      local item = reaper.GetTrackMediaItem(t, j)
+      reaper.SetMediaItemInfo_Value(item, "B_LOOPSRC", 0)
+      created[#created + 1] = { track_index = i, item_index = j }
+    end
+  end
+  refresh_tracks()
+  refresh_arrange()
+  return { ret = { path = path, created = created } }
+end
+
 function DSL.list_envelopes(ti)
   local t = track_at(ti)
   local out = {}
@@ -827,6 +937,19 @@ function DSL.add_marker(pos_beats, name, is_region, end_beats)
     name or "", -1, 0)
   refresh_timeline()
   return { ret = { marker_index = idx } }
+end
+
+function DSL.save_project(path)
+  if path and path ~= "" then
+    reaper.Main_SaveProjectEx(0, path, 0)
+    return { ret = { saved = true, path = path, copy = true } }
+  end
+  local _, proj = reaper.EnumProjects(-1, "")
+  if not proj or proj == "" then
+    error("unsaved project: pass path")
+  end
+  reaper.Main_SaveProject(0, false)
+  return { ret = { saved = true, path = proj, copy = false } }
 end
 
 function DSL.render_project(path, opts)
@@ -932,7 +1055,7 @@ dispatch = function(req)
         or func == "get_midi_notes" or func == "list_track_fx"
         or func == "get_fx_params" or func == "list_sends"
         or func == "list_items" or func == "list_envelopes"
-        or func == "get_envelope" then
+        or func == "get_envelope" or func == "save_project" then
       return run()
     end
     reaper.Undo_BeginBlock()

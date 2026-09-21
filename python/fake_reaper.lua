@@ -44,7 +44,7 @@ function new_track(name)
 end
 
 function new_item(pos, len)
-  return { position = pos, length = len, notes = {} }
+  return { position = pos, length = len, notes = {}, ccs = {}, loop = true }
 end
 
 reaper = {}
@@ -170,6 +170,50 @@ reaper.MIDI_Sort = function(take)
 end
 reaper.MIDI_GetPPQPosFromProjQN = function(_, qn) return qn * PPQ end
 reaper.MIDI_GetProjQNFromPPQPos = function(_, ppq) return ppq / PPQ end
+reaper.MIDI_InsertCC = function(take, sel, muted, ppq, chanmsg, chan, msg2, msg3)
+  hit("MIDI_InsertCC")
+  take.ccs = take.ccs or {}
+  take.ccs[#take.ccs + 1] = {
+    sel = sel, muted = muted, ppq = ppq, chanmsg = chanmsg,
+    chan = chan, msg2 = msg2, msg3 = msg3,
+  }
+end
+reaper.SetEditCurPos = function(pos)
+  hit("SetEditCurPos")
+  cursor = pos
+end
+reaper.SetTrackSelected = function(t, sel)
+  t.selected = sel and true or false
+end
+reaper.Main_OnCommand = function(id)
+  hit("Main_OnCommand")
+  if id == 40297 then
+    for _, t in ipairs(tracks) do t.selected = false end
+  end
+end
+reaper.InsertMedia = function(path, mode)
+  hit("InsertMedia")
+  if mode == 1 then
+    local t = new_track("imported")
+    t.items[1] = new_item(0, 4)
+    tracks[#tracks + 1] = t
+  else
+    local t = tracks[#tracks]
+    for _, x in ipairs(tracks) do
+      if x.selected then t = x break end
+    end
+    t.items[#t.items + 1] = new_item(0, 4)
+  end
+  return true
+end
+reaper.Main_SaveProject = function(_, force)
+  hit("Main_SaveProject")
+  saved = { force = force }
+end
+reaper.Main_SaveProjectEx = function(_, path, flags)
+  hit("Main_SaveProjectEx")
+  saved = { path = path, flags = flags }
+end
 
 -- sends / envelopes / fx
 reaper.GetTrackNumSends = function(t) return #t.sends end

@@ -22,7 +22,7 @@ else:
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "reaper-mcp"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 HEARTBEAT_STALE = float(os.environ.get("REAPER_MCP_HEARTBEAT_STALE", "5"))
 POLL = float(os.environ.get("REAPER_MCP_POLL", "0.015"))
 # A fast bridge answers inside the first few milliseconds, so poll tightly at
@@ -178,8 +178,8 @@ class Bridge:
             while time.time() < deadline:
                 if os.path.exists(self.resp):
                     try:
-                        with open(self.resp, encoding="utf-8") as f:
-                            data = json.loads(f.read())
+                        with open(self.resp, "rb") as f:
+                            data = json.loads(f.read().decode("utf-8", "replace"))
                     except (OSError, ValueError):
                         time.sleep(_poll_wait(started))
                         continue
@@ -239,6 +239,18 @@ NOTE = {
     "required": ["pitch", "start_beats"],
 }
 
+CC = {
+    "type": "object",
+    "properties": {
+        "start_beats": {"type": "number"},
+        "channel": {"type": "integer", "minimum": 0, "maximum": 15},
+        "cc": {"type": "integer", "minimum": 0, "maximum": 127},
+        "value": {"type": "integer", "minimum": 0, "maximum": 127},
+        "program": {"type": "integer", "minimum": 0, "maximum": 127},
+    },
+    "required": ["start_beats"],
+}
+
 
 tool(
     "status",
@@ -285,16 +297,18 @@ tool(
 tool(
     "midi",
     "MIDI on a track item. Times are absolute project beats. "
-    "action: create_item | add | get | replace | update | delete. "
-    "replace rewrites the whole take in one undo step; add only appends.",
+    "action: create_item | add | get | replace | update | delete | cc. "
+    "replace rewrites the whole take in one undo step; add only appends. "
+    "cc inserts CC (`cc`+`value`) or program change (`program`) via ccs[].",
     obj({
         "action": {"type": "string",
-                   "enum": ["create_item", "add", "get", "replace", "update", "delete"]},
+                   "enum": ["create_item", "add", "get", "replace", "update", "delete", "cc"]},
         "track_index": {"type": "integer", "minimum": 0},
         "item_index": {"type": "integer", "minimum": 0},
         "start_beats": {"type": "number", "minimum": 0},
         "length_beats": {"type": "number", "minimum": 0},
         "notes": {"type": "array", "items": NOTE},
+        "ccs": {"type": "array", "items": CC},
         "note_index": {"type": "integer", "minimum": 0},
         "note_indices": {"type": "array", "items": {"type": "integer", "minimum": 0}},
         "pitch": {"type": "integer", "minimum": 0, "maximum": 127},
@@ -316,6 +330,8 @@ tool(
                        "velocity", "channel", "muted"))]),
         "delete": lambda: b.call("delete_midi_notes",
                                  [a["track_index"], a["item_index"], a["note_indices"]]),
+        "cc": lambda: b.call("add_midi_cc",
+                             [a["track_index"], a["item_index"], a.get("ccs") or []]),
     }[a["action"]](),
 )
 
@@ -375,10 +391,11 @@ tool(
 
 tool(
     "item",
-    "Media items on a track. action: list | update. "
-    "fade_in / fade_out are seconds (REAPER native). position/length are beats.",
+    "Media items on a track. action: list | update | import. "
+    "fade_in / fade_out are seconds (REAPER native). position/length are beats. "
+    "import uses a path already on the REAPER host; as_new_track=true makes new tracks.",
     obj({
-        "action": {"type": "string", "enum": ["list", "update"]},
+        "action": {"type": "string", "enum": ["list", "update", "import"]},
         "track_index": {"type": "integer", "minimum": 0},
         "item_index": {"type": "integer", "minimum": 0},
         "gain_db": {"type": "number"},
@@ -388,13 +405,21 @@ tool(
         "mute": {"type": "boolean"},
         "position_beats": {"type": "number", "minimum": 0},
         "length_beats": {"type": "number", "minimum": 0},
-    }, ["action", "track_index"]),
+        "start_beats": {"type": "number", "minimum": 0},
+        "path": {"type": "string"},
+        "as_new_track": {"type": "boolean"},
+    }, ["action"]),
     lambda b, a: {
         "list": lambda: b.call("list_items", [a["track_index"]]),
         "update": lambda: b.call("update_item", [a["track_index"], a["item_index"],
                                                  _props(a, ("gain_db", "fade_in", "fade_out",
                                                             "loop", "mute", "position_beats",
                                                             "length_beats"))]),
+        "import": lambda: b.call("import_media", [a.get("path"), {
+            "track_index": a.get("track_index"),
+            "start_beats": a.get("start_beats"),
+            "as_new_track": a.get("as_new_track", False),
+        }]),
     }[a["action"]](),
 )
 
@@ -432,10 +457,11 @@ tool(
 
 tool(
     "project",
-    "Project-level edits. action: tempo | time_signature | time_selection | marker.",
+    "Project-level edits. action: tempo | time_signature | time_selection | marker | save. "
+    "save with path writes a copy (no dialog). save without path needs an already-named project.",
     obj({
         "action": {"type": "string",
-                   "enum": ["tempo", "time_signature", "time_selection", "marker"]},
+                   "enum": ["tempo", "time_signature", "time_selection", "marker", "save"]},
         "bpm": {"type": "number", "minimum": 1},
         "numerator": {"type": "integer", "minimum": 1},
         "denominator": {"type": "integer", "minimum": 1},
@@ -445,6 +471,7 @@ tool(
         "name": {"type": "string"},
         "is_region": {"type": "boolean"},
         "region_end_beats": {"type": "number", "minimum": 0},
+        "path": {"type": "string"},
     }, ["action"]),
     lambda b, a: {
         "tempo": lambda: b.call("set_tempo", [a["bpm"]]),
@@ -455,6 +482,7 @@ tool(
         "marker": lambda: b.call("add_marker", [
             a["position_beats"], a.get("name", ""), a.get("is_region", False),
             a.get("region_end_beats")]),
+        "save": lambda: b.call("save_project", [a.get("path")]),
     }[a["action"]](),
 )
 
